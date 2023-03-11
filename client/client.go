@@ -14,7 +14,6 @@ import (
 )
 
 // Call represent an active RPC
-
 type Call struct {
 	Seq           uint64
 	ServiceMethod string
@@ -22,7 +21,7 @@ type Call struct {
 	Args interface{}
 	// reply from function
 	Reply interface{}
-	//
+	// if err occurs , it will be set
 	Error error
 	//Strobes when call is complete
 	Done chan *Call
@@ -33,17 +32,21 @@ func (call *Call) done() {
 	call.Done <- call
 }
 
+// Client may be used by multiple goroutines simultaneously
+// There may be multiple outstanding Calls associated with single cient
 type Client struct {
-	// codec for both clent and server
+	// codec for both clent and server, encode &decode
 	cc codec.Codec
 	// server option
 	opt *server.Option
 	// mutedx to protect request sending in order, prevent header confllict
 	sending sync.Mutex
-	// every request got this header.
+	// every request got this header.only need when sending request
+	// and request is mutex , every client got one mutex
 	header codec.Header
-	mu     sync.Mutex
-	// sending request unique id
+	// protect following
+	mu sync.Mutex
+	// sending request unique id for each request
 	seq uint64
 	// store unfinished request, key is number, value is Call instance
 	pending map[uint64]*Call
@@ -75,6 +78,7 @@ func NewClient(conn net.Conn, opt *server.Option) (*Client, error) {
 
 func newClientCodec(cc codec.Codec, opt *server.Option) *Client {
 	client := &Client{
+		// seq start from 1, 0 means invalid call
 		seq:     1,
 		cc:      cc,
 		opt:     opt,
@@ -84,6 +88,8 @@ func newClientCodec(cc codec.Codec, opt *server.Option) *Client {
 	return client
 }
 
+// passing server address and create client instance
+// Dial connect to an RPC server at specified network addr
 func Dial(network, address string, opts ...*server.Option) (client *Client, err error) {
 	opt, err := server.ParseOptions(opts...)
 	if err != nil {
@@ -102,6 +108,27 @@ func Dial(network, address string, opts ...*server.Option) (client *Client, err 
 	return NewClient(conn, opt)
 }
 
+// Call invokes the named function, waits for it to complete,
+// and returns its error status.
+func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
+	// blocking by call.Done chan ,wait for response
+	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
+	return call.Error
+}
+
+// Go is async api
+func (client *Client) Go(serviceMethod string, args, reply interface{}, done chan *Call) *Call {
+	call := &Call{
+		ServiceMethod: serviceMethod,
+		Args:          args,
+		Reply:         reply,
+		Done:          done,
+	}
+	client.send(call)
+	return call
+}
+
+// Close connection
 func (client *Client) Close() error {
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -112,6 +139,14 @@ func (client *Client) Close() error {
 	return client.cc.Close()
 }
 
+// IsAvailable return true if the client does work
+func (client *Client) IsAvailable() bool {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return !client.shutdown && !client.closing
+}
+
+// register call param into client.pending and update client.seq
 func (client *Client) registerCall(call *Call) (uint64, error) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -127,6 +162,7 @@ func (client *Client) registerCall(call *Call) (uint64, error) {
 	return client.seq, nil
 }
 
+// remove call from client.pending according to seq
 func (client *Client) removeCall(seq uint64) *Call {
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -135,11 +171,13 @@ func (client *Client) removeCall(seq uint64) *Call {
 	return call
 }
 
+// terminate call when error occurs
 func (client *Client) terminateCalls(err error) {
 	client.sending.Lock()
 	defer client.sending.Unlock()
 	client.mu.Lock()
 	defer client.mu.Unlock()
+	// shutdown
 	client.shutdown = true
 	for _, call := range client.pending {
 		call.Error = err
@@ -147,6 +185,11 @@ func (client *Client) terminateCalls(err error) {
 	}
 }
 
+/****
+1. call doesn't exist ,request not complete, or cancel by other reason
+2. call exist , but server process err, means h.Error not empty
+3. call exit , server process normal, need to read from body
+*/
 func (client *Client) recive() {
 	var err error
 	for err == nil {
@@ -176,27 +219,7 @@ func (client *Client) recive() {
 	client.terminateCalls(err)
 }
 
-// Call invokes the named function, waits for it to complete,
-// and returns its error status.
-func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
-	// blocking by call.Done chan ,wait for response
-	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
-}
-
-// Go is async api
-func (client *Client) Go(serviceMethod string, args, reply interface{}, done chan *Call) *Call {
-	call := &Call{
-		ServiceMethod: serviceMethod,
-		Args:          args,
-		Reply:         reply,
-		Done:          done,
-	}
-	client.send(call)
-	return call
-}
-
-//
+// send request
 func (client *Client) send(call *Call) {
 	// 	// make sure that the client will send a complete request
 	client.sending.Lock()

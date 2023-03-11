@@ -82,21 +82,25 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 		return
 	}
 	if opt.MagicNumber != MagicNumber {
+		log.Printf("rpc server: invliad magin number %x", opt.MagicNumber)
 		return
 	}
 	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil {
+		log.Printf("rpc server: invalid codec type %s", opt.CodecType)
 		return
 	}
 
-	// server.
+	server.serveCodec(f(conn))
 }
 
 // invalidRequest is a placeholder for response argv when error occurs
 var invalidRequest = struct{}{}
 
 func (server *Server) serveCodec(cc codec.Codec) {
+	// make sure send a complete response
 	sending := new(sync.Mutex)
+	// wait until all request handled
 	wg := new(sync.WaitGroup)
 	for {
 		// 1. first readRequest
@@ -120,6 +124,7 @@ func (server *Server) serveCodec(cc codec.Codec) {
 	_ = cc.Close()
 }
 
+// process read request
 func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 	h, err := server.readRequestHeader(cc)
 	if err != nil {
@@ -134,6 +139,7 @@ func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 	return req, nil
 }
 
+// handle request
 func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 	var h codec.Header
 	if err := cc.ReadHeader(&h); err != nil {
@@ -145,6 +151,7 @@ func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 	return &h, nil
 }
 
+// send response
 func (server *Server) sendReponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
 	sending.Lock()
 	defer sending.Unlock()
@@ -154,6 +161,7 @@ func (server *Server) sendReponse(cc codec.Codec, h *codec.Header, body interfac
 	}
 }
 
+// handle Request use goroutine to concurrent process request
 func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	//
 	// print and send hello msg to client
